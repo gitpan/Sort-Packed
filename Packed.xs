@@ -8,6 +8,8 @@
 
 #include "ppport.h"
 
+#include "merge.h"
+
 #define BYTE_ORDER_BE 0
 #define BYTE_ORDER_LE 1
 #define BYTE_ORDER_LAST BYTE_ORDER_LE
@@ -20,12 +22,11 @@
 
 #define CUTOFF 16
 
-/*
 static void
-dump_keys(char *name, unsigned char *pv, UV size, UV record_size, UV offset) {
+dump_keys(char *name, unsigned char *pv, UV nelems, UV record_size, UV offset) {
     int i;
     fprintf(stderr, "%s\n", name);
-    for (i = 0; i < size; i++) {
+    for (i = 0; i < nelems; i++) {
         int j;
         fprintf(stderr, "%04x:", i);
         for (j = offset; j < record_size; j++) {
@@ -46,22 +47,21 @@ dump_pos(UV *pos) {
     }
     fprintf(stderr, "\n");
 }
-*/
 
 static void
-radix_sort(unsigned char *pv, UV size, UV record_size, UV offset) {
-    if (size > CUTOFF) {
+radixsort(unsigned char *pv, UV nelems, UV record_size, UV offset) {
+    if (nelems > CUTOFF) {
         UV count[256];
         UV pos[256];
         UV i, last, offset1;
         unsigned char *ptr, *end;
 
-        /* dump_keys("in", pv, size, record_size, offset); */
+        /* dump_keys("in", pv, nelems, record_size, offset); */
 
         for (i = 0; i < 256; i++)
             count[i] = 0;
         ptr = pv + offset;
-        end = ptr + size * record_size;
+        end = ptr + nelems * record_size;
         while (ptr < end) {
             count[*ptr]++;
             ptr += record_size;
@@ -105,7 +105,7 @@ radix_sort(unsigned char *pv, UV size, UV record_size, UV offset) {
                 }
             }
             
-            /* dump_keys("out", pv, size, record_size, offset); */
+            /* dump_keys("out", pv, nelems, record_size, offset); */
             
             offset1 = offset + 1;
             if (offset1 < record_size) {
@@ -113,14 +113,14 @@ radix_sort(unsigned char *pv, UV size, UV record_size, UV offset) {
                 for (last = i = 0; i < 256; last = pos[i++]) {
                     UV count = pos[i] - last;
                     if (count > 1)
-                        radix_sort(pv + last * record_size, count, record_size, offset1);
+                        radixsort(pv + last * record_size, count, record_size, offset1);
                 }
             }
         }
     }
     else {
         UV i;
-        for (i = 1; i < size; i++) {
+        for (i = 1; i < nelems; i++) {
             unsigned char *current = pv + i * record_size;
             UV min = 0, max = i;
             while (min < max) {
@@ -167,7 +167,7 @@ radix_sort(unsigned char *pv, UV size, UV record_size, UV offset) {
 }
 
 static void
-reverse(char *ptr, IV len, IV record_size) {
+reverse_packed(char *ptr, IV len, IV record_size) {
     if (record_size % sizeof(unsigned int) == 0) {
         int *start, *end;
         record_size /= sizeof(int);
@@ -208,10 +208,12 @@ reverse(char *ptr, IV len, IV record_size) {
 }
 
 static void
-pre_radix(unsigned char *pv, UV size, UV value_size, UV value_type, UV byte_order) {
+pre_sort(unsigned char *pv, UV nelems, UV value_size, UV value_type, UV byte_order) {
+/*     fprintf(stderr, "pre_sort pv: %p, nelems: %d, value_size: %d, value_type: %d, byte_order: %d\n", */
+/*             pv, nelems, value_size, value_type, byte_order); */
     if (byte_order || value_type) {
         unsigned char *ptr = pv;
-        unsigned char *end = ptr + size * value_size;
+        unsigned char *end = ptr + nelems * value_size;
         UV value_size_1 = ( ( value_type == TYPE_FLOAT_X86
                               && (value_size == 12 || value_size == 16) )
                             ? 9
@@ -247,10 +249,12 @@ pre_radix(unsigned char *pv, UV size, UV value_size, UV value_type, UV byte_orde
 }
 
 static void
-post_radix(unsigned char *pv, UV size, UV value_size, UV value_type, UV byte_order) {
+post_sort(unsigned char *pv, UV nelems, UV value_size, UV value_type, UV byte_order) {
+/*     fprintf(stderr, "post_sort pv: %p, nelems: %d, value_size: %d, value_type: %d, byte_order: %d\n", */
+/*             pv, nelems, value_size, value_type, byte_order); */
     if (byte_order || value_type) {
         unsigned char *ptr = pv;
-        unsigned char *end = ptr + size * value_size;
+        unsigned char *end = ptr + nelems * value_size;
         UV value_size_1 = ( ( value_type == TYPE_FLOAT_X86
                               && (value_size == 12 || value_size == 16) )
                             ? 9
@@ -284,10 +288,93 @@ post_radix(unsigned char *pv, UV size, UV value_size, UV value_type, UV byte_ord
     }
 }
 
+typedef struct _cmp_extra {
+    UV key_size;
+    SV *cmp;
+    SV *a, *b;
+} my_extra;
+
+static int
+custom_cmp(pTHX_
+           const unsigned char *a, const unsigned char *b,
+           const my_extra *extra) {
+    dSP;
+    int r = 0;
+    ENTER;
+    SAVETMPS;
+    /* fprintf(stderr, "custom_cmp a: %p, b: %p, $a: %p, $b: %p\n", a, b, extra->a, extra->b); */
+    sv_setpvn(extra->a, a, extra->key_size);
+    sv_setpvn(extra->b, b, extra->key_size);
+    PUSHMARK(SP);
+    PUTBACK;
+    call_sv(extra->cmp, G_SCALAR);
+    SPAGAIN;
+    r = POPi;
+    PUTBACK;
+    FREETMPS;
+    LEAVE;
+    return r;
+}
+
+static int
+custom_cmp_inv(pTHX_
+           const unsigned char *a, const unsigned char *b,
+           const my_extra *extra) {
+    return custom_cmp(aTHX_ b, a, extra);
+}
+
+static int 
+uchar_cmp(pTHX_
+          const unsigned char *a, const unsigned char *b,
+          const my_extra *extra) {
+    UV i = extra->key_size;
+    while (i--) {
+        if (*a != *b)
+            return (*a < *b) ? -1 : 1;
+        a++; b++;
+    }
+    return 0;
+}
+
+static int 
+uchar_cmp_inv(pTHX_
+          const unsigned char *a, const unsigned char *b,
+          const my_extra *extra) {
+    UV i = extra->key_size;
+    while (i--) {
+        if (*a != *b)
+            return (*a < *b) ? 1 : -1;
+        a++; b++;
+    }
+    return 0;
+}
+
+static void
+expand(unsigned char *from, UV nelems, UV rs, UV ers, unsigned char *to) {
+    UV i = nelems;
+    while (i-- > 0) {
+        UV j = rs;
+        while (j-- > 0) *(to++) = *(from++);
+        j = ers - rs;
+        while (j-- > 0) *(to++) = 0;
+    }
+}
+
+static void
+unexpand(unsigned char *from, UV nelems, UV rs, UV ers, unsigned char *to) {
+    UV i = nelems;
+    while (i-- > 0) {
+        UV j = rs;
+        while (j-- > 0) *(to++) = *(from++);
+        from += ers - rs;
+    }
+}
+
+
 MODULE = Sort::Packed		PACKAGE = Sort::Packed		
 
 void
-_sort_packed(vector, dir, value_size, value_type, byte_order, rep)
+_radixsort_packed(vector, dir, value_size, value_type, byte_order, rep)
    SV *vector
    IV dir
    UV value_size
@@ -298,7 +385,7 @@ CODE:
     STRLEN len;
     char *pv = SvPV(vector, len);
     UV record_size = value_size * rep;
-    UV size;
+    UV nelems;
     /* Perl_warn(aTHX_ "vector: %p, dir: %d, vsize: %d, vtype: %d bo: %d, rep: %d",
        vector, dir, value_size, value_type, byte_order, rep); */
     if (value_size == 0 || rep == 0 || dir == 0 ||
@@ -306,14 +393,91 @@ CODE:
         Perl_croak(aTHX_ "internal error, bad value");
     if (len % record_size != 0)
         Perl_croak(aTHX_ "vector length %d is not a multiple of record size %d", len, record_size);
-    size = len / record_size;
-    if (size > 1) {
-        pre_radix(pv, size * rep, value_size, value_type, byte_order);
-        radix_sort((unsigned char *)pv, size, record_size, 0);
-        post_radix(pv, size * rep, value_size, value_type, byte_order);
+    nelems = len / record_size;
+    if (nelems > 1) {
+        pre_sort(pv, nelems * rep, value_size, value_type, byte_order);
+        radixsort((unsigned char *)pv, nelems, record_size, 0);
+        post_sort(pv, nelems * rep, value_size, value_type, byte_order);
         if (dir < 0)
-            reverse((unsigned char *)pv, size, record_size);
+            reverse_packed((unsigned char *)pv, nelems, record_size);
     }
+
+void
+_mergesort_packed(vector, cmp, dir, value_size, value_type, byte_order, rep)
+    SV *vector
+    SV *cmp
+    IV dir
+    UV value_size
+    UV value_type
+    UV byte_order
+    UV rep
+CODE:
+    STRLEN len;
+    unsigned char *pv = (unsigned char *)SvPV(vector, len);
+    UV record_size = value_size * rep;
+    UV expanded_record_size = record_size;
+    UV nelems;
+    my_extra extra;
+    my_cmp_t ccmp;
+    if (value_size == 0 || rep == 0 || dir == 0 ||
+        byte_order > BYTE_ORDER_LAST || value_type > TYPE_LAST)
+        Perl_croak(aTHX_ "internal error, bad value");
+    if (len % record_size != 0)
+        Perl_croak(aTHX_ "vector length %d is not a multiple of record size %d", len, record_size);
+    nelems = len / record_size;
+    if (nelems > 1) {
+        extra.key_size = record_size;
+        /* dump_keys("in", pv, nelems, record_size, 0); */
+        if (SvOK(cmp)) {
+            GV *gv;
+            SV *cv = SvRV(cmp);
+            HV *stash = CvSTASH(cv);
+            if (!stash)
+                Perl_croak(aTHX_ "internal error: null stash");
+            if (SvTYPE(cv) != SVt_PVCV)
+                Perl_croak(aTHX_ "reference to comparison function expected");
+            if (!hv_fetch(stash, "a", 1, TRUE))
+                Perl_croak(aTHX_ "unexpected null gv pointer");
+            gv = *(GV**)hv_fetch(stash, "a", 1, TRUE);
+            if (SvTYPE(gv) != SVt_PVGV)
+                gv_init(gv, stash, "a", 1, TRUE);
+            SAVESPTR(GvSV(gv));
+            extra.a = GvSV(gv) = sv_2mortal(newSV(extra.key_size + 1));
+            gv = *(GV**)hv_fetch(stash, "b", 1, TRUE);
+            if (SvTYPE(gv) != SVt_PVGV)
+                gv_init(gv, stash, "b", 1, TRUE);
+            SAVESPTR(GvSV(gv));
+            extra.b = GvSV(gv) = sv_2mortal(newSV(extra.key_size + 1));
+            ccmp = (my_cmp_t)(dir > 0 ? &custom_cmp : &custom_cmp_inv);
+            extra.cmp = cmp;
+        }
+        else {
+            ccmp = (my_cmp_t)(dir > 0 ? &uchar_cmp : &uchar_cmp_inv);
+            extra.cmp = 0;
+            pre_sort(pv, nelems * rep, value_size, value_type, byte_order);
+        }
+        if (record_size < PSIZE / 2) {
+            expanded_record_size = PSIZE / 2;
+            pv = SvPVX(sv_2mortal(newSV(nelems * expanded_record_size)));
+            /* Newx(pv, nelems * expanded_record_size, unsigned char); */
+            expand(SvPV_nolen(vector), nelems,
+                   record_size, expanded_record_size,
+                   pv);
+        }
+        PUTBACK;
+        mergesort(aTHX_ pv, nelems, expanded_record_size, ccmp, &extra);
+        SPAGAIN;
+        if (expanded_record_size != record_size) {
+            unexpand(pv, nelems,
+                     record_size, expanded_record_size,
+                     SvPV_nolen(vector));
+            pv = SvPV_nolen(vector);
+        }
+        if (!extra.cmp)
+            post_sort(pv, nelems * rep, value_size, value_type, byte_order);
+        /* dump_keys("out", pv, nelems, record_size, 0); */
+    }
+        
 
 void
 _reverse_packed(vector, record_size)
@@ -322,10 +486,11 @@ _reverse_packed(vector, record_size)
 CODE:
     STRLEN len;
     char *pv = SvPV(vector, len);
-    UV size;
+    UV nelems;
     if (record_size <= 0)
         Perl_croak(aTHX_ "bad record size %d", record_size);
     if (len % record_size != 0)
-        Perl_croak(aTHX_ "vector length %d is not a multiple of record size %d", len, record_size);
-    size = len / record_size;
-    reverse((unsigned char *)pv, size, record_size);
+        Perl_croak(aTHX_ "vector length %d is not a multiple of record nelems %d", len, record_size);
+    nelems = len / record_size;
+    reverse_packed((unsigned char *)pv, nelems, record_size);
+

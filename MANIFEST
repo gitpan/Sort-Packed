@@ -3,7 +3,10 @@ Makefile.PL
 MANIFEST
 Packed.xs
 ppport.h
+merge.h
+sample/benchmark.pl
 README
 t/Sort-Packed.t
+t/pods.t
 lib/Sort/Packed.pm
 META.yml                                 Module meta-data (added by MakeMaker)
