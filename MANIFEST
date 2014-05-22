@@ -9,4 +9,5 @@ README
 t/Sort-Packed.t
 t/pods.t
 lib/Sort/Packed.pm
-META.yml                                 Module meta-data (added by MakeMaker)
+META.yml                                 Module YAML meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)
